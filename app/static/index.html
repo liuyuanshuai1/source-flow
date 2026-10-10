@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="从开源项目中发现可验证的商业机会。" />
+    <title>OpenRadar | 开源商业机会雷达</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="OpenRadar 首页">
+        <span class="brand-mark">OR</span>
+        <span>OpenRadar</span>
+      </a>
+      <nav class="nav" aria-label="主导航">
+        <a href="#opportunities">今日商机</a>
+        <a href="#method">分析方法</a>
+        <a href="/docs" target="_blank" rel="noreferrer">API</a>
+      </nav>
+      <div class="engine-status" id="engineStatus">连接分析引擎</div>
+    </header>
+
+    <main id="top">
+      <section class="hero shell">
+        <div class="hero-copy">
+          <p class="eyebrow">开源项目商业机会雷达</p>
+          <h1>别只追涨星。<br />找到有人愿意买单的部分。</h1>
+          <p class="hero-note">输入 GitHub 仓库，获得目标客户、商业路径、交付难度、许可证闸门与七天验证计划。</p>
+        </div>
+
+        <form class="analysis-console" id="analyzeForm" novalidate>
+          <div class="console-label-row">
+            <label for="repositoryUrl">分析一个公开仓库</label>
+            <span>约 10-60 秒</span>
+          </div>
+          <div class="input-row">
+            <input
+              id="repositoryUrl"
+              name="repositoryUrl"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              placeholder="https://github.com/owner/repository"
+              aria-describedby="formMessage"
+              required
+            />
+            <button class="primary-button" id="analyzeButton" type="submit">生成商机报告</button>
+          </div>
+          <p class="form-message" id="formMessage">不会修改仓库。默认读取公开元数据，Pi 模式将进行仓库级深度分析。</p>
+          <div class="analysis-stages" id="analysisStages" hidden aria-live="polite">
+            <span class="stage active">验证仓库</span>
+            <span class="stage">读取信号</span>
+            <span class="stage">评估路径</span>
+            <span class="stage">生成报告</span>
+          </div>
+        </form>
+      </section>
+
+      <section class="signal-strip shell" aria-label="产品原则">
+        <div><strong>许可证先行</strong><span>风险不是普通扣分项</span></div>
+        <div><strong>证据驱动</strong><span>结论关联仓库事实</span></div>
+        <div><strong>行动导向</strong><span>输出七天验证实验</span></div>
+      </section>
+
+      <section class="opportunity-section shell" id="opportunities">
+        <div class="section-heading">
+          <h2>今日观察清单</h2>
+          <p>这里使用示例数据展示报告形态。提交仓库后将生成新的初筛报告。</p>
+        </div>
+        <div class="opportunity-grid" id="opportunityGrid" aria-live="polite">
+          <article class="skeleton-card"><span></span><span></span><span></span></article>
+          <article class="skeleton-card"><span></span><span></span><span></span></article>
+        </div>
+      </section>
+
+      <section class="method-section shell" id="method">
+        <div class="method-intro">
+          <h2>分析的不是热度，是交付闭环。</h2>
+          <p>每份报告把项目能力翻译为客户、付费理由、可卖能力和下一步实验。没有明确许可证时，系统停止商业推荐。</p>
+        </div>
+        <div class="method-flow" aria-label="分析流程">
+          <div><span>发现</span><strong>仓库事实</strong><p>定位、技术栈、维护与部署信号</p></div>
+          <div><span>判断</span><strong>四条路径</strong><p>SaaS、桌面、私有化、实施服务</p></div>
+          <div><span>验证</span><strong>行动计划</strong><p>客户访谈、演示环境与成本核算</p></div>
+        </div>
+      </section>
+    </main>
+
+    <dialog class="report-dialog" id="reportDialog">
+      <div class="dialog-shell">
+        <button class="close-button" id="closeReport" type="button" aria-label="关闭报告">关闭</button>
+        <div id="reportContent"></div>
+      </div>
+    </dialog>
+
+    <footer class="footer shell">
+      <span>OpenRadar MVP</span>
+      <span>判断仅用于商业调研，不构成法律意见。</span>
+    </footer>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

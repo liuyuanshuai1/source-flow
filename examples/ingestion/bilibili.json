@@ -1,0 +1,13 @@
+{
+  "platform": "bilibili",
+  "bvid": "BVEXAMPLE",
+  "url": "https://www.bilibili.com/video/BVEXAMPLE/",
+  "title": "演示视频",
+  "transcript": "这是一段虚构的字幕样本。",
+  "segments": [{"from": 0, "to": 2, "content": "这是一段虚构的字幕样本。"}],
+  "language": "zh",
+  "source_type": "example",
+  "published_at": null,
+  "collected_at": "2026-01-01T00:00:00Z",
+  "status": "partial"
+}

@@ -1,40 +1,18 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
-name = "bili-text"
+name = "openradar-mvp"
 version = "0.1.0"
-description = "macOS CLI that transcribes and summarizes the latest video of Bilibili finance creators."
-readme = "README.md"
+description = "Open-source commercial opportunity radar powered by Pi skills"
 requires-python = ">=3.12"
-license = { text = "MIT" }
 dependencies = [
-    "dashscope>=1.20.0",
-    "minio>=7.2.0",
-    "python-dotenv>=1.0.0",
+  "fastapi>=0.116.0",
+  "uvicorn>=0.35.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    "pytest>=8.0.0",
-    "ruff>=0.5.0",
+  "httpx>=0.28.1",
+  "pytest>=8.4.0",
 ]
-
-[project.scripts]
-bili-text = "bili_text.cli:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/bili_text"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
-pythonpath = ["src"]
-
-[tool.ruff]
-line-length = 100
-src = ["src", "tests"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]

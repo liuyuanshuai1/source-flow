@@ -1,0 +1,14 @@
+{
+  "platform": "xiaohongshu",
+  "note_id": "example-note",
+  "url": "https://www.xiaohongshu.com/explore/example-note",
+  "title": "演示笔记",
+  "body": "这是一条用于测试格式转换的虚构笔记。",
+  "author_id": "example",
+  "author_name": "示例作者",
+  "hashtags": [],
+  "media": [],
+  "published_at": null,
+  "collected_at": "2026-01-01T00:00:00Z",
+  "status": "partial"
+}

@@ -1,83 +1,37 @@
-# bili-text
+# SourceFlow
 
-macOS 本地 CLI：输入一个或多个 B 站 UP 主 **UID**，对每位 UP 主**发布时间最新**的 **P1** 视频完成音频提取、语音识别、单 UP 汇总与全任务汇总，所有结果持久化为 Markdown。
+SourceFlow 是一个本地多源内容采集原型。Python 采集器通过 BrowserAct 控制已登录的 Chrome，检查配置的 X、小红书和 B 站账号，把内容标准化后写入 SQLite；Codex 可读取本次新增 JSON 生成摘要。仓库还包含一个独立的 OpenRadar 演示应用。
 
-## 前置条件
+当前实现、边界与改进顺序见[实现记录与改进方案](docs/current-implementation-and-improvement-plan.md)。本仓库不包含个人订阅清单、浏览器凭据、原始采集数据、数据库或本机自动任务配置。GitHub Trending 的实际采集位于独立项目，不在此采集器的默认运行范围内。
 
-- macOS
-- Python 3.12+
-- 可执行文件：`yt-dlp`、`ffmpeg`（需在 `PATH` 中）
-- 阿里云百炼 DashScope API Key
-- 公网可达的 MinIO HTTPS API 端点（供 DashScope 拉取临时音频）
+## 本地配置
 
-## 安装
+使用 `uv` 管理 Python 环境：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync
+cp config/sources.example.json config/sources.json
 ```
 
-## 配置
+编辑 `config/sources.json`，把示例账号换成自己要检查的来源，并设置 `since_at`。该文件已被 Git 忽略。采集器还需要已安装的 BrowserAct CLI、可用的 Chrome 配置及相应网站的浏览器登录态。
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填入 DASHSCOPE_API_KEY、MINIO_* 等
+uv run python -m sourceflow.collector
 ```
 
-| 变量 | 必需 | 说明 |
-| --- | --- | --- |
-| `DASHSCOPE_API_KEY` | 是 | ASR 与汇总共用 |
-| `MINIO_ENDPOINT` | 是 | 公网 HTTPS **API** 端点（非管理控制台） |
-| `MINIO_BUCKET` | 是 | 专用于临时音频的桶 |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | 是 | MinIO 凭据 |
-| `BILI_COOKIE` | 否 | 需要登录态时传给 `yt-dlp` |
-| `ASR_MODEL` | 否 | 默认 `qwen3-asr-flash` |
-| `SUMMARY_MODEL` | 否 | 默认 `deepseek-v4-flash` |
+运行结果写入本地 `data/sourceflow.sqlite3` 与 `data/raw/runs/YYYY-MM-DD/`。这些路径均被 Git 忽略。采集器默认检查 `x,xiaohongshu,bilibili`；可用 `--platforms` 指定子集。当前运行记录中的 `success` 不能保证所有历史页面均已覆盖，详情见实现记录。
 
-进程环境变量优先于 `.env`。
+## 样本转换与演示应用
 
-## 用法
+`examples/ingestion/` 中的四份 JSON 是虚构样本，只用于验证数据格式：
 
 ```bash
-# 单个 UID
-bili-text 12345678 --output-dir ./out
-
-# 多个 UID（按顺序处理，不去重）
-bili-text 111 222 111 --output-dir ./out
-
-# 或直接运行
-python -m bili_text.cli 12345678
+uv run python -m sourceflow.cli
+uv run uvicorn app.main:app --reload
 ```
 
-## 输出
-
-一次任务共享一个时间戳：
-
-```
-out/
-├── 12345678/
-│   └── {timestamp}-BVxxxxxx.md    # 源信息 + 单 UP 汇总 + 完整转写
-└── {timestamp}-summary.md         # 全任务汇总
-```
-
-终端只显示阶段进度与最终计数，不打印转写正文。
-
-## 开发与测试
+## 测试
 
 ```bash
-pytest          # 83 项测试（外部依赖均为 fake，无需网络）
-ruff check src tests
+uv run python -m pytest
 ```
-
-领域术语与架构约定见 [`CONTEXT.md`](CONTEXT.md)。PRD 见 [`PRD-bili-finance-transcriber.md`](PRD-bili-finance-transcriber.md)。
-
-## 手动冒烟
-
-配置真实 `.env` 后，对可丢弃的测试 UID 运行：
-
-```bash
-bili-text <UID> --output-dir ./smoke-out
-```
-
-确认 `./smoke-out/{UID}/` 与 `./smoke-out/{timestamp}-summary.md` 已生成。

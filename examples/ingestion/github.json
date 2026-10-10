@@ -1,0 +1,11 @@
+{
+  "platform": "github",
+  "full_name": "example/example-repo",
+  "html_url": "https://github.com/example/example-repo",
+  "description": "Synthetic repository record for format testing.",
+  "language": "Python",
+  "is_sample": true,
+  "published_at": null,
+  "collected_at": "2026-01-01T00:00:00Z",
+  "status": "sample"
+}

@@ -1,0 +1,7 @@
+{
+  "since_at": "2026-09-01T00:00:00Z",
+  "sources": [
+    {"key": "x:example", "platform": "x", "external_id": "example", "name": "Example", "url": "https://x.com/example"},
+    {"key": "bilibili:12345678", "platform": "bilibili", "external_id": "12345678", "name": "Example", "url": "https://space.bilibili.com/12345678/video"}
+  ]
+}

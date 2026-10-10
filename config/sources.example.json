@@ -1,0 +1,9 @@
+{
+  "since_at": "2026-01-01T00:00:00Z",
+  "timezone": "Asia/Shanghai",
+  "sources": [
+    {"key": "x:example", "platform": "x", "external_id": "example", "name": "Replace with an X account", "url": "https://x.com/example"},
+    {"key": "xiaohongshu:example", "platform": "xiaohongshu", "external_id": "example", "name": "Replace with a Xiaohongshu account", "url": "https://www.xiaohongshu.com/user/profile/example"},
+    {"key": "bilibili:12345678", "platform": "bilibili", "external_id": "12345678", "name": "Replace with a Bilibili UP", "url": "https://space.bilibili.com/12345678/video"}
+  ]
+}

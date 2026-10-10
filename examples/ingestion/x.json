@@ -1,0 +1,13 @@
+{
+  "platform": "x",
+  "post_id": "example-post",
+  "url": "https://x.com/example/status/example-post",
+  "author_handle": "example",
+  "author_name": "Example",
+  "content": "This is a synthetic record used to demonstrate normalization.",
+  "text_kind": "paraphrase",
+  "observed_via": "example",
+  "published_at": null,
+  "collected_at": "2026-01-01T00:00:00Z",
+  "status": "sample"
+}
