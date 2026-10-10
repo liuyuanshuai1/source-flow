@@ -10,3 +10,11 @@ __pycache__/
 config/sources.json
 data/
 outputs/
+.agents/
+.pi/
+docs/digests/
+docs/workflows/
+docs/bilibili-subtitle-source.md
+docs/collection-plan.md
+docs/daily-automation.md
+docs/sourceflow-design.md
