@@ -10,10 +10,11 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sourceflow.db import (
@@ -21,11 +22,14 @@ from sourceflow.db import (
     DEFAULT_DB,
     ROOT,
     connect,
+    clear_pending_item,
+    due_pending_items,
     existing_external_ids,
     insert_candidates,
-    latest_time,
     load_sources,
     record_source_seen,
+    record_source_check,
+    save_pending_item,
     seen_external_ids,
     source_cursor,
     update_source_cursor,
@@ -150,6 +154,12 @@ class SourceResult:
     cursor_id: str | None
     cursor_at: str | None
     error: str | None = None
+    pages_checked: int = 0
+    oldest_checked_at: str | None = None
+    stop_reason: str | None = None
+    pending: list[dict[str, Any]] | None = None
+    resolved_pending: list[str] | None = None
+    pending_total: int = 0
 
 
 def _iso_from_millis(value: int | str | None) -> str | None:
@@ -166,6 +176,18 @@ def _iso_from_seconds(value: int | str | None) -> str | None:
 
 def _newer(value: str | None, cutoff: str) -> bool:
     return bool(value and utc_time(value) > utc_time(cutoff))
+
+
+def _since_at(conn: Any, source_key: str) -> str:
+    row = conn.execute("SELECT since_at FROM sources WHERE source_key=?", (source_key,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown source: {source_key}")
+    return row["since_at"]
+
+
+def _retry_after(observed_at: str, *, hours: int) -> str:
+    return (datetime.fromisoformat(utc_time(observed_at).replace("Z", "+00:00"))
+            + timedelta(hours=hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _eval_after_ready(browser: BrowserAct, script: Path, selector: str) -> Any:
@@ -188,32 +210,45 @@ def collect_x(
 ) -> SourceResult:
     key = source["key"]
     handle = source["external_id"]
-    cutoff = latest_time(conn, key)
+    since_at = _since_at(conn, key)
     existing = existing_external_ids(conn, key)
-    cursor = source_cursor(conn, key)["last_seen_external_id"]
+    cursor_state = source_cursor(conn, key)
+    cursor = cursor_state["last_seen_external_id"]
+    verified = bool(cursor_state["coverage_verified"])
+    boundary_at = cursor_state["last_seen_at"] if verified else since_at
     rows_by_id: dict[str, dict[str, Any]] = {}
+    pages_checked = 0
+    stops: list[str] = []
     try:
         for suffix in ("", "/with_replies"):
             browser.navigate(f"https://x.com/{handle}{suffix}")
+            stop = "page_limit"
             for scroll_index in range(max_scrolls + 1):
                 rows = _eval_after_ready(browser, SCRIPTS / "extract-x-timeline.js", "article[data-testid='tweet']")
-                for row in rows:
-                    if row.get("handle", "").lower() == handle.lower():
-                        rows_by_id[row["id"]] = row
-                timestamps = [row.get("published_at") for row in rows if row.get("published_at")]
-                ids = {row.get("id") for row in rows}
-                reached_boundary = cursor in ids or any(not _newer(stamp, cutoff) for stamp in timestamps)
-                if reached_boundary or scroll_index == max_scrolls:
+                pages_checked += 1
+                own = [row for row in rows if row.get("handle", "").lower() == handle.lower()
+                       and row.get("id") and row.get("published_at")]
+                for row in own:
+                    rows_by_id[row["id"]] = row
+                tail = own[-1] if own else None
+                # A pinned old post near the top is not evidence that the lower part was checked.
+                if tail and (verified and tail["id"] in existing and not _newer(tail["published_at"], boundary_at)
+                             or not _newer(tail["published_at"], since_at)):
+                    stop = "known_boundary" if tail["id"] in existing else "since_boundary"
+                    break
+                if scroll_index == max_scrolls:
                     break
                 browser.scroll()
                 browser.wait_stable(3500)
+            stops.append(f"{suffix or '/posts'}:{stop}")
     except Exception as exc:
-        return SourceResult(key, "x", "failed", [], [], None, None, str(exc))
+        return SourceResult(key, "x", "failed", [], [], None, None, str(exc), pages_checked,
+                            stop_reason="browser_error")
 
     ordered = sorted(rows_by_id.values(), key=lambda row: utc_time(row["published_at"]), reverse=True)
     items = []
     for row in ordered:
-        if row["id"] in existing or not _newer(row.get("published_at"), cutoff):
+        if row["id"] in existing or not _newer(row.get("published_at"), since_at) and utc_time(row["published_at"]) != since_at:
             continue
         items.append(
             {
@@ -239,11 +274,14 @@ def collect_x(
     return SourceResult(
         key,
         "x",
-        "success",
+        "complete" if all("page_limit" not in stop for stop in stops) else "partial",
         items,
         [],
         newest["id"] if newest else cursor,
-        newest.get("published_at") if newest else source_cursor(conn, key)["last_seen_at"],
+        newest.get("published_at") if newest else cursor_state["last_seen_at"],
+        pages_checked=pages_checked,
+        oldest_checked_at=ordered[-1]["published_at"] if ordered else None,
+        stop_reason=",".join(stops),
     )
 
 
@@ -252,15 +290,17 @@ def collect_xiaohongshu(
     conn: Any,
     source: dict[str, Any],
     observed_at: str,
+    pending_rows: list[dict[str, Any]] | None = None,
 ) -> SourceResult:
     key = source["key"]
     author_id = source["external_id"]
-    cutoff = latest_time(conn, key)
+    since_at = _since_at(conn, key)
     existing = existing_external_ids(conn, key)
     cursor = source_cursor(conn, key)
+    verified = bool(cursor["coverage_verified"])
     try:
         browser.navigate(source["url"])
-        rows = _eval_after_ready(
+        page_rows = _eval_after_ready(
             browser,
             SCRIPTS / "extract-xiaohongshu-space.js",
             "a[href*='/explore/'], a[href*='/user/profile/']",
@@ -268,13 +308,20 @@ def collect_xiaohongshu(
     except Exception as exc:
         return SourceResult(key, "xiaohongshu", "failed", [], [], None, None, str(exc))
 
-    rows = [row for row in rows if row.get("author") == author_id and row.get("id") and row.get("time")]
-    ordered = sorted(rows, key=lambda row: int(row["time"]), reverse=True)
+    page_rows = [row for row in page_rows if row.get("author") == author_id and row.get("id") and row.get("time")]
+    rows_by_id = {row["id"]: row for row in pending_rows or [] if row.get("id")}
+    rows_by_id.update({row["id"]: row for row in page_rows})
+    ordered = sorted(rows_by_id.values(), key=lambda row: int(row.get("time") or 0), reverse=True)
     items: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    resolved: list[str] = []
+    pending_ids = {row.get("id") for row in pending_rows or []}
     for row in ordered:
         published_at = _iso_from_millis(row.get("time"))
-        if row["id"] in existing or not _newer(published_at, cutoff):
+        if row["id"] in existing and row["id"] not in pending_ids:
+            continue
+        if not published_at or utc_time(published_at) < since_at:
             continue
         canonical = f"https://www.xiaohongshu.com/user/profile/{author_id}/{row['id']}"
         detail_url = canonical
@@ -290,6 +337,14 @@ def collect_xiaohongshu(
             )
         except Exception as exc:
             warnings.append({"external_id": row["id"], "reason": f"detail_partial: {exc}"})
+        if detail.get("id") != row["id"] or not (detail.get("title") or detail.get("desc")):
+            pending.append({
+                "external_id": row["id"], "url": canonical,
+                "payload": {"id": row["id"], "title": row.get("title"), "time": row.get("time"),
+                            "type": row.get("type"), "author": author_id},
+                "reason": "detail_unavailable", "retry_after": _retry_after(observed_at, hours=1),
+            })
+            continue
         event_at = _iso_from_millis(detail.get("time")) or published_at
         items.append(
             {
@@ -312,15 +367,28 @@ def collect_xiaohongshu(
                 },
             }
         )
-    newest = ordered[0] if ordered else None
+        resolved.append(row["id"])
+    visible = sorted(page_rows, key=lambda row: int(row["time"]), reverse=True)
+    newest = visible[0] if visible else None
+    oldest = _iso_from_millis(visible[-1]["time"]) if visible else None
+    boundary_at = cursor["last_seen_at"] if verified else since_at
+    reached = bool(visible and (len(visible) < 20 or
+                   (verified and visible[-1]["id"] in existing and not _newer(oldest, boundary_at)) or
+                   (oldest and utc_time(oldest) <= since_at)))
+    status = "complete" if reached and not pending else "partial"
     return SourceResult(
         key,
         "xiaohongshu",
-        "success",
+        status,
         items,
         warnings,
         newest["id"] if newest else cursor["last_seen_external_id"],
         _iso_from_millis(newest.get("time")) if newest else cursor["last_seen_at"],
+        pages_checked=1,
+        oldest_checked_at=oldest,
+        stop_reason="known_boundary" if reached else "initial_page_limit",
+        pending=pending,
+        resolved_pending=resolved,
     )
 
 
@@ -330,11 +398,13 @@ def collect_bilibili(
     source: dict[str, Any],
     observed_at: str,
     raw_dir: Path,
+    pending_rows: list[dict[str, Any]] | None = None,
 ) -> SourceResult:
     key = source["key"]
     expected_mid = str(source["external_id"])
-    cutoff = latest_time(conn, key)
+    since_at = _since_at(conn, key)
     cursor = source_cursor(conn, key)
+    verified = bool(cursor["coverage_verified"])
     cursor_bvid = (cursor["last_seen_external_id"] or "").split(":", 1)[0]
     existing_bvids = {value.split(":", 1)[0] for value in existing_external_ids(conn, key)}
     seen_bvids = seen_external_ids(conn, key)
@@ -344,22 +414,27 @@ def collect_bilibili(
     except Exception as exc:
         return SourceResult(key, "bilibili", "failed", [], [], None, None, str(exc))
 
-    candidates = []
+    pending_ids = {row.get("bvid") for row in pending_rows or []}
+    candidates_by_id = {row["bvid"]: row for row in pending_rows or [] if row.get("bvid")}
+    known_bvids = existing_bvids | seen_bvids | ({cursor_bvid} if cursor_bvid else set())
+    visible_ids = [row.get("bvid") for row in rows if row.get("bvid")]
+    reached_boundary = bool(verified and cursor_bvid and cursor_bvid in visible_ids)
     for row in rows:
         bvid = row.get("bvid")
         if not bvid:
             continue
-        if bvid == cursor_bvid or bvid in existing_bvids:
-            break
-        if bvid in seen_bvids:
+        if bvid in known_bvids and bvid not in pending_ids:
             continue
-        candidates.append(row)
+        candidates_by_id[bvid] = row
 
     items: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    resolved: list[str] = []
     newest_owner_id = cursor_bvid or None
     newest_owner_at = cursor["last_seen_at"]
-    for row in candidates:
+    oldest_checked_at: str | None = None
+    for row in candidates_by_id.values():
         bvid = row["bvid"]
         try:
             browser.navigate(row["url"])
@@ -369,8 +444,13 @@ def collect_bilibili(
                 raw = browser.eval_file(SCRIPTS / "bilibili-subtitle-source.js")
         except Exception as exc:
             skipped.append({"bvid": bvid, "url": row["url"], "reason": f"extract_failed: {exc}"})
+            pending.append({"external_id": bvid, "url": row["url"],
+                            "payload": {"bvid": bvid, "title": row.get("title")},
+                            "reason": "extract_failed", "retry_after": _retry_after(observed_at, hours=1)})
             continue
         published_at = _iso_from_seconds(raw.get("pubdate"))
+        if published_at and (oldest_checked_at is None or utc_time(published_at) < utc_time(oldest_checked_at)):
+            oldest_checked_at = published_at
         owner_mid = str((raw.get("owner") or {}).get("mid") or "")
         if owner_mid == expected_mid and published_at and (
             newest_owner_at is None or utc_time(published_at) > utc_time(newest_owner_at)
@@ -380,8 +460,8 @@ def collect_bilibili(
         reason = None
         if owner_mid != expected_mid:
             reason = f"owner_mismatch:{owner_mid or 'unknown'}"
-        elif not _newer(published_at, cutoff):
-            reason = "not_newer_than_cutoff"
+        elif not published_at or utc_time(published_at) < since_at:
+            reason = "before_since_or_unknown_time"
         elif raw.get("status") != "ok":
             reason = raw.get("status") or "subtitle_unavailable"
         if reason:
@@ -394,6 +474,14 @@ def collect_bilibili(
                     "reason": reason,
                 }
             )
+            if not reason.startswith("owner_mismatch:") and reason != "before_since_or_unknown_time":
+                pending.append({"external_id": bvid, "url": row["url"],
+                                "payload": {"bvid": bvid, "title": raw.get("title") or row.get("title")},
+                                "reason": reason,
+                                "retry_after": _retry_after(observed_at, hours=168 if reason in
+                                                            {"no_subtitle", "chinese_subtitle_missing"} else 1)})
+            else:
+                resolved.append(bvid)
             continue
         raw_path = raw_dir / f"{bvid}.json"
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,14 +510,23 @@ def collect_bilibili(
                 },
             }
         )
+        resolved.append(bvid)
+    if not cursor_bvid and oldest_checked_at and utc_time(oldest_checked_at) <= since_at:
+        reached_boundary = True
+    status = "complete" if reached_boundary and not pending else "partial"
     return SourceResult(
         key,
         "bilibili",
-        "success",
+        status,
         items,
         skipped,
         newest_owner_id or cursor["last_seen_external_id"],
         newest_owner_at,
+        pages_checked=1,
+        oldest_checked_at=oldest_checked_at,
+        stop_reason="known_boundary" if reached_boundary else "visible_list_limit",
+        pending=pending,
+        resolved_pending=resolved,
     )
 
 
@@ -438,27 +535,42 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _scroll_limit(conn: Any, source_key: str, default: int) -> int:
+    previous = conn.execute(
+        """SELECT pages_checked, stop_reason FROM source_checks
+           WHERE source_key=? AND status='partial' ORDER BY checked_at DESC LIMIT 1""",
+        (source_key,),
+    ).fetchone()
+    if previous and "page_limit" in (previous["stop_reason"] or ""):
+        return max(default, min(30, previous["pages_checked"]))
+    return default
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     run_date = args.date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    output_dir = args.output_dir or ROOT / "data" / "raw" / "runs" / run_date
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+    output_dir = args.output_dir or ROOT / "data" / "raw" / "runs" / run_date / run_id
     platforms = {value.strip() for value in args.platforms.split(",") if value.strip()}
     config = json.loads(args.config.read_text(encoding="utf-8"))
     sources = [source for source in config["sources"] if source["platform"] in platforms]
     conn = connect(args.db)
     load_sources(conn, args.config)
-    session = f"sourceflow-{run_date.replace('-', '')}-{os.getpid()}"
+    session = f"sourceflow-{run_id}-{os.getpid()}"
     browser = BrowserAct(args.browser_id, session)
     results: list[SourceResult] = []
     try:
         for source in sources:
+            pending_rows = due_pending_items(conn, source["key"], started_at)
             if source["platform"] == "x":
-                result = collect_x(browser, conn, source, started_at, args.max_scrolls)
+                result = collect_x(browser, conn, source, started_at,
+                                   _scroll_limit(conn, source["key"], args.max_scrolls))
             elif source["platform"] == "xiaohongshu":
-                result = collect_xiaohongshu(browser, conn, source, started_at)
+                result = collect_xiaohongshu(browser, conn, source, started_at, pending_rows)
             elif source["platform"] == "bilibili":
-                result = collect_bilibili(browser, conn, source, started_at, ROOT / "data" / "raw" / "bilibili")
+                result = collect_bilibili(browser, conn, source, started_at,
+                                          ROOT / "data" / "raw" / "bilibili", pending_rows)
             else:
                 continue
             results.append(result)
@@ -470,12 +582,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for item in result.items:
             candidates_by_key[(item["platform"], item["item_type"], item["external_id"])] = item
     candidates = list(candidates_by_key.values())
-    import_result = {"inserted": 0, "duplicate": 0, "older": 0}
+    import_result: dict[str, Any] = {"inserted": 0, "updated": 0, "duplicate": 0, "older": 0,
+                                     "inserted_keys": [], "updated_keys": []}
     if not args.dry_run:
         try:
-            import_result = insert_candidates(conn, candidates) if candidates else import_result
+            import_result = insert_candidates(conn, candidates, commit=False) if candidates else import_result
             for result in results:
-                if result.status == "success":
+                for pending in result.pending or []:
+                    save_pending_item(conn, result.source_key, pending["external_id"], pending["url"],
+                                      pending["payload"], pending["reason"], started_at, pending["retry_after"])
+                for external_id in result.resolved_pending or []:
+                    clear_pending_item(conn, result.source_key, external_id)
+                unresolved = conn.execute(
+                    "SELECT COUNT(*) FROM pending_items WHERE source_key=?", (result.source_key,)
+                ).fetchone()[0]
+                result.pending_total = unresolved
+                if unresolved and result.status == "complete":
+                    result.status = "partial"
+                    result.stop_reason = f"{result.stop_reason},pending_items" if result.stop_reason else "pending_items"
+                record_source_check(conn, run_id, result.source_key, result.status, started_at,
+                                    result.pages_checked, result.oldest_checked_at,
+                                    result.stop_reason, len(result.items))
+                if result.status == "complete":
                     update_source_cursor(
                         conn,
                         result.source_key,
@@ -483,30 +611,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         result.cursor_at,
                         started_at,
                     )
-                    if result.platform == "bilibili":
-                        for skipped in result.skipped:
-                            reason = str(skipped.get("reason") or "skipped")
-                            if skipped.get("bvid") and not reason.startswith("extract_failed"):
-                                record_source_seen(
-                                    conn,
-                                    result.source_key,
-                                    skipped["bvid"],
-                                    reason,
-                                    started_at,
-                                    {"url": skipped.get("url"), "title": skipped.get("title")},
-                                )
+                if result.platform == "bilibili":
+                    for skipped in result.skipped:
+                        reason = str(skipped.get("reason") or "skipped")
+                        if skipped.get("bvid") and not reason.startswith("extract_failed"):
+                            record_source_seen(
+                                conn, result.source_key, skipped["bvid"], reason, started_at,
+                                {"url": skipped.get("url"), "title": skipped.get("title")},
+                            )
+                    for external_id in result.resolved_pending or []:
+                        record_source_seen(conn, result.source_key, external_id, "resolved", started_at)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
+    actual_keys = set(import_result["inserted_keys"]) | set(import_result["updated_keys"])
+    actual_items = [item for item in candidates
+                    if (item["platform"], item["item_type"], item["external_id"]) in actual_keys]
     for platform in platforms:
         platform_items = [item for item in candidates if item["platform"] == platform]
         _write_json(
             output_dir / f"{platform}.json",
             {"observed_at": started_at, "platform": platform, "items": platform_items},
         )
-    _write_json(output_dir / "new_items.json", {"observed_at": started_at, "items": candidates})
+    _write_json(output_dir / "new_items.json", {"observed_at": started_at, "items": actual_items})
 
     finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     platform_stats: dict[str, dict[str, int]] = {}
@@ -514,25 +643,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         subset = [result for result in results if result.platform == platform]
         platform_stats[platform] = {
             "sources": len(subset),
-            "success": sum(result.status == "success" for result in subset),
-            "failed": sum(result.status != "success" for result in subset),
+            "success": sum(result.status == "complete" for result in subset),
+            "partial": sum(result.status == "partial" for result in subset),
+            "failed": sum(result.status == "failed" for result in subset),
             "candidates": sum(len(result.items) for result in subset),
+            "new": sum(item["platform"] == platform for item in actual_items),
             "skipped": sum(len(result.skipped) for result in subset),
         }
+    db_counts = {key: value for key, value in import_result.items() if not key.endswith("_keys")}
     report = {
+        "run_id": run_id,
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_seconds": round(time.monotonic() - started, 2),
         "output_dir": str(output_dir),
         "new_items_file": str(output_dir / "new_items.json"),
+        "run_file": str(output_dir / "run.json"),
+        "dry_run": args.dry_run,
         "platforms": platform_stats,
-        "database": import_result,
+        "database": db_counts,
         "sources": [
             {
                 "source_key": result.source_key,
                 "status": result.status,
-                "new": len(result.items),
+                "new": sum(item["source_key"] == result.source_key for item in actual_items),
+                "candidates": len(result.items),
                 "skipped": len(result.skipped),
+                "pages_checked": result.pages_checked,
+                "oldest_checked_at": result.oldest_checked_at,
+                "stop_reason": result.stop_reason,
+                "pending": result.pending_total if not args.dry_run else len(result.pending or []),
                 "error": result.error,
             }
             for result in results
@@ -557,6 +697,7 @@ def main() -> None:
     report = run(args)
     print(json.dumps({
         "duration_seconds": report["duration_seconds"],
+        "run_file": report["run_file"],
         "new_items_file": report["new_items_file"],
         "platforms": report["platforms"],
         "database": report["database"],

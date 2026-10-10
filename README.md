@@ -19,7 +19,7 @@ cp config/sources.example.json config/sources.json
 uv run python -m sourceflow.collector
 ```
 
-运行结果写入本地 `data/sourceflow.sqlite3` 与 `data/raw/runs/YYYY-MM-DD/`。这些路径均被 Git 忽略。采集器默认检查 `x,xiaohongshu,bilibili`；可用 `--platforms` 指定子集。当前运行记录中的 `success` 不能保证所有历史页面均已覆盖，详情见实现记录。
+运行结果写入本地 `data/sourceflow.sqlite3` 与 `data/raw/runs/YYYY-MM-DD/<run_id>/`。命令输出本次的 `run_file` 和 `new_items_file` 路径；这些文件均被 Git 忽略。采集器默认检查 `x,xiaohongshu,bilibili`，可用 `--platforms` 指定子集。来源状态分为 `complete`、`partial` 和 `failed`；触及页面检查上限或仍有待重试项时不会推进覆盖游标。受网站列表加载方式限制，`partial` 可能持续出现，详情见实现记录。
 
 ## 样本转换与演示应用
 

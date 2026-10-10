@@ -60,7 +60,8 @@ def connect(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             source_key TEXT PRIMARY KEY REFERENCES sources(source_key),
             last_seen_external_id TEXT,
             last_seen_at TEXT,
-            last_checked_at TEXT NOT NULL
+            last_checked_at TEXT NOT NULL,
+            coverage_verified INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS source_seen (
             source_key TEXT NOT NULL REFERENCES sources(source_key),
@@ -71,16 +72,40 @@ def connect(path: Path = DEFAULT_DB) -> sqlite3.Connection:
             metadata_json TEXT NOT NULL,
             PRIMARY KEY(source_key, external_id)
         );
+        CREATE TABLE IF NOT EXISTS pending_items (
+            source_key TEXT NOT NULL REFERENCES sources(source_key),
+            external_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_attempt_at TEXT NOT NULL,
+            retry_after TEXT NOT NULL,
+            PRIMARY KEY(source_key, external_id)
+        );
+        CREATE TABLE IF NOT EXISTS source_checks (
+            run_id TEXT NOT NULL,
+            source_key TEXT NOT NULL REFERENCES sources(source_key),
+            status TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            pages_checked INTEGER NOT NULL,
+            oldest_checked_at TEXT,
+            stop_reason TEXT,
+            candidate_count INTEGER NOT NULL,
+            PRIMARY KEY(run_id, source_key)
+        );
         """
     )
     if "raw_ref" not in {row["name"] for row in conn.execute("PRAGMA table_info(items)")}:
         conn.execute("ALTER TABLE items ADD COLUMN raw_ref TEXT")
+    if "coverage_verified" not in {row["name"] for row in conn.execute("PRAGMA table_info(source_cursors)")}:
+        conn.execute("ALTER TABLE source_cursors ADD COLUMN coverage_verified INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
-def source_cursor(conn: sqlite3.Connection, source_key: str) -> dict[str, str | None]:
+def source_cursor(conn: sqlite3.Connection, source_key: str) -> dict[str, Any]:
     row = conn.execute(
-        "SELECT last_seen_external_id, last_seen_at, last_checked_at FROM source_cursors WHERE source_key=?",
+        "SELECT last_seen_external_id, last_seen_at, last_checked_at, coverage_verified FROM source_cursors WHERE source_key=?",
         (source_key,),
     ).fetchone()
     if row:
@@ -94,6 +119,7 @@ def source_cursor(conn: sqlite3.Connection, source_key: str) -> dict[str, str | 
         "last_seen_external_id": latest["external_id"] if latest else None,
         "last_seen_at": latest["event_at"] if latest else None,
         "last_checked_at": None,
+        "coverage_verified": 0,
     }
 
 
@@ -105,12 +131,13 @@ def update_source_cursor(
     checked_at: str,
 ) -> None:
     conn.execute(
-        """INSERT INTO source_cursors(source_key, last_seen_external_id, last_seen_at, last_checked_at)
-           VALUES (?, ?, ?, ?)
+        """INSERT INTO source_cursors(source_key, last_seen_external_id, last_seen_at, last_checked_at, coverage_verified)
+           VALUES (?, ?, ?, ?, 1)
            ON CONFLICT(source_key) DO UPDATE SET
              last_seen_external_id=excluded.last_seen_external_id,
              last_seen_at=excluded.last_seen_at,
-             last_checked_at=excluded.last_checked_at""",
+             last_checked_at=excluded.last_checked_at,
+             coverage_verified=1""",
         (source_key, external_id, utc_time(seen_at) if seen_at else None, utc_time(checked_at)),
     )
 
@@ -127,6 +154,65 @@ def seen_external_ids(conn: sqlite3.Connection, source_key: str) -> set[str]:
         row["external_id"]
         for row in conn.execute("SELECT external_id FROM source_seen WHERE source_key=?", (source_key,))
     }
+
+
+def due_pending_items(conn: sqlite3.Connection, source_key: str, now: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "external_id": row["external_id"],
+            "url": row["url"],
+            **json.loads(row["payload_json"]),
+        }
+        for row in conn.execute(
+            "SELECT external_id, url, payload_json FROM pending_items WHERE source_key=? AND retry_after<=? ORDER BY first_seen_at",
+            (source_key, utc_time(now)),
+        )
+    ]
+
+
+def save_pending_item(
+    conn: sqlite3.Connection,
+    source_key: str,
+    external_id: str,
+    url: str,
+    payload: dict[str, Any],
+    reason: str,
+    observed_at: str,
+    retry_after: str,
+) -> None:
+    now = utc_time(observed_at)
+    conn.execute(
+        """INSERT INTO pending_items(source_key, external_id, url, payload_json, reason,
+           first_seen_at, last_attempt_at, retry_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(source_key, external_id) DO UPDATE SET
+             url=excluded.url, payload_json=excluded.payload_json, reason=excluded.reason,
+             last_attempt_at=excluded.last_attempt_at, retry_after=excluded.retry_after""",
+        (source_key, external_id, url, json.dumps(payload, ensure_ascii=False, sort_keys=True),
+         reason, now, now, utc_time(retry_after)),
+    )
+
+
+def clear_pending_item(conn: sqlite3.Connection, source_key: str, external_id: str) -> None:
+    conn.execute("DELETE FROM pending_items WHERE source_key=? AND external_id=?", (source_key, external_id))
+
+
+def record_source_check(
+    conn: sqlite3.Connection,
+    run_id: str,
+    source_key: str,
+    status: str,
+    checked_at: str,
+    pages_checked: int,
+    oldest_checked_at: str | None,
+    stop_reason: str | None,
+    candidate_count: int,
+) -> None:
+    conn.execute(
+        """INSERT INTO source_checks(run_id, source_key, status, checked_at, pages_checked,
+           oldest_checked_at, stop_reason, candidate_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, source_key, status, utc_time(checked_at), pages_checked,
+         utc_time(oldest_checked_at) if oldest_checked_at else None, stop_reason, candidate_count),
+    )
 
 
 def record_source_seen(
@@ -159,6 +245,23 @@ def load_sources(conn: sqlite3.Connection, config_path: Path = DEFAULT_CONFIG) -
                ON CONFLICT(source_key) DO UPDATE SET name=excluded.name, url=excluded.url""",
             {**source, "since_at": since_at},
         )
+    # Older runs stored unavailable subtitles only in source_seen. Move those
+    # stable video IDs into the retry queue without copying browser credentials.
+    for row in conn.execute(
+        """SELECT s.source_key, s.external_id, s.status, s.first_seen_at, s.last_seen_at,
+                  s.metadata_json
+           FROM source_seen s JOIN sources src ON src.source_key=s.source_key
+           WHERE src.platform='bilibili' AND s.status IN ('no_subtitle', 'chinese_subtitle_missing')
+             AND NOT EXISTS (SELECT 1 FROM pending_items p
+                             WHERE p.source_key=s.source_key AND p.external_id=s.external_id)"""
+    ).fetchall():
+        metadata = json.loads(row["metadata_json"])
+        url = metadata.get("url") or f"https://www.bilibili.com/video/{row['external_id']}/"
+        save_pending_item(
+            conn, row["source_key"], row["external_id"], url,
+            {"bvid": row["external_id"], "title": metadata.get("title")},
+            row["status"], row["first_seen_at"], row["last_seen_at"],
+        )
     conn.commit()
     return len(config["sources"])
 
@@ -175,32 +278,26 @@ def latest_time(conn: sqlite3.Connection, source_key: str) -> str:
     return max(row["since_at"], row["newest"] or row["since_at"])
 
 
-def insert_candidates(conn: sqlite3.Connection, candidates: list[dict[str, Any]]) -> dict[str, int]:
-    counts = {"inserted": 0, "duplicate": 0, "older": 0}
-    cutoffs = {item["source_key"]: latest_time(conn, item["source_key"]) for item in candidates}
-    # Compare every candidate with the cutoff at the start of this batch.
+def insert_candidates(
+    conn: sqlite3.Connection, candidates: list[dict[str, Any]], *, commit: bool = True
+) -> dict[str, Any]:
+    counts: dict[str, Any] = {"inserted": 0, "updated": 0, "duplicate": 0, "older": 0,
+                              "inserted_keys": [], "updated_keys": []}
     ordered = sorted(candidates, key=lambda item: utc_time(item["event_at"]))
     for item in ordered:
-        source = conn.execute("SELECT platform FROM sources WHERE source_key = ?", (item["source_key"],)).fetchone()
+        source = conn.execute("SELECT platform, since_at FROM sources WHERE source_key = ?", (item["source_key"],)).fetchone()
         if source is None:
             raise ValueError(f"unknown source: {item['source_key']}")
         if source["platform"] != item["platform"]:
             raise ValueError(f"platform mismatch: {item['source_key']}")
         existing = conn.execute(
-            "SELECT id FROM items WHERE platform=? AND item_type=? AND external_id=?",
+            "SELECT id, content_text, content_status FROM items WHERE platform=? AND item_type=? AND external_id=?",
             (item["platform"], item["item_type"], item["external_id"]),
         ).fetchone()
         observed_at = utc_time(item["observed_at"])
-        if existing:
-            conn.execute("UPDATE items SET last_seen_at=? WHERE id=?", (observed_at, existing["id"]))
-            counts["duplicate"] += 1
-            continue
         event_at = utc_time(item["event_at"])
         baseline = bool(item.get("baseline_before_since"))
-        existing_for_source = conn.execute(
-            "SELECT 1 FROM items WHERE source_key=? LIMIT 1", (item["source_key"],)
-        ).fetchone()
-        if event_at <= cutoffs[item["source_key"]] and not (baseline and not existing_for_source):
+        if not existing and event_at < source["since_at"] and not baseline:
             counts["older"] += 1
             continue
         published_at = utc_time(item["published_at"]) if item.get("published_at") else None
@@ -215,6 +312,21 @@ def insert_candidates(conn: sqlite3.Connection, candidates: list[dict[str, Any]]
                 raise ValueError(f"Bilibili raw_ref does not match item: {raw_ref}")
             if content_text is None:
                 content_text = raw.get("transcript") or ""
+        if existing:
+            if content_text and content_text != existing["content_text"] and existing["content_status"] != "complete":
+                conn.execute(
+                    """UPDATE items SET content_text=?, content_status=?, title=?, raw_ref=?,
+                       published_at=?, last_seen_at=?, metadata_json=? WHERE id=?""",
+                    (content_text, item.get("content_status", "complete"), item.get("title"), raw_ref,
+                     published_at, observed_at,
+                     json.dumps(item.get("metadata", {}), ensure_ascii=False, sort_keys=True), existing["id"]),
+                )
+                counts["updated"] += 1
+                counts["updated_keys"].append((item["platform"], item["item_type"], item["external_id"]))
+            else:
+                conn.execute("UPDATE items SET last_seen_at=? WHERE id=?", (observed_at, existing["id"]))
+                counts["duplicate"] += 1
+            continue
         conn.execute(
             """INSERT INTO items(source_key, platform, item_type, external_id, url, title,
                content_text, published_at, event_at, first_seen_at, last_seen_at,
@@ -229,5 +341,7 @@ def insert_candidates(conn: sqlite3.Connection, candidates: list[dict[str, Any]]
             ),
         )
         counts["inserted"] += 1
-    conn.commit()
+        counts["inserted_keys"].append((item["platform"], item["item_type"], item["external_id"]))
+    if commit:
+        conn.commit()
     return counts
